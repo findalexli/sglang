@@ -11,11 +11,107 @@ python3 -m unittest test_tokenizer_manager.TestTokenizerResultExtraction
 python3 -m unittest test_tokenizer_manager.TestTokenizerManagerIntegration
 """
 
+import asyncio
 import unittest
 from typing import List, Optional, Union
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
+
+import transformers
+import types
+from types import SimpleNamespace
+import sys
+import torch
+import importlib
+
+
+_triton_stub = sys.modules.setdefault("triton", types.ModuleType("triton"))
+_triton_lang_stub = sys.modules.setdefault("triton.language", types.ModuleType("triton.language"))
+sys.modules.setdefault("sgl_kernel", types.ModuleType("sgl_kernel"))
+_sgl_kvcache_stub = sys.modules.setdefault("sgl_kernel.kvcacheio", types.ModuleType("sgl_kernel.kvcacheio"))
+_triton_runtime_stub = sys.modules.setdefault("triton.runtime", types.ModuleType("triton.runtime"))
+_triton_runtime_jit_stub = sys.modules.setdefault(
+    "triton.runtime.jit", types.ModuleType("triton.runtime.jit")
+)
+_triton_runtime_stub.jit = _triton_runtime_jit_stub
+_triton_stub.runtime = _triton_runtime_stub
+
+if not hasattr(_triton_stub, "jit"):
+    _triton_stub.jit = lambda fn=None, **_: fn if fn is not None else (lambda f: f)
+
+if not hasattr(_triton_stub, "Config"):
+    class _TritionConfig:
+        def __init__(self, *args, **kwargs):
+            pass
+
+
+    _triton_stub.Config = _TritionConfig
+
+if not hasattr(_triton_stub, "autotune"):
+    def _autotune_stub(*args, **kwargs):
+        def decorator(fn):
+            return fn
+
+        return decorator
+
+
+    _triton_stub.autotune = _autotune_stub
+
+for _fn_name in [
+    "transfer_kv_all_layer",
+    "transfer_kv_all_layer_direct_lf_pf",
+    "transfer_kv_all_layer_lf_pf",
+    "transfer_kv_all_layer_mla",
+    "transfer_kv_all_layer_mla_lf_pf",
+    "transfer_kv_direct",
+    "transfer_kv_per_layer",
+    "transfer_kv_per_layer_direct_pf_lf",
+    "transfer_kv_per_layer_mla",
+    "transfer_kv_per_layer_mla_pf_lf",
+    "transfer_kv_per_layer_pf_lf",
+]:
+    setattr(_sgl_kvcache_stub, _fn_name, lambda *args, **kwargs: None)
+
+if not hasattr(_triton_runtime_jit_stub, "JITFunction"):
+    class _DummyJIT:
+        pass
+
+
+    _triton_runtime_jit_stub.JITFunction = _DummyJIT
+
+if not hasattr(_triton_lang_stub, "constexpr"):
+    _triton_lang_stub.constexpr = lambda value: value
+
+
+if not hasattr(transformers, "Qwen2_5_VLProcessor"):
+    class _StubQwenProcessor:  # minimal stub to satisfy optional imports
+        pass
+
+
+    transformers.Qwen2_5_VLProcessor = _StubQwenProcessor
+    try:
+        from transformers.utils import import_utils
+
+        import_utils._import_structure.setdefault("models.qwen2_5_vl", [])
+        if "Qwen2_5_VLProcessor" not in import_utils._import_structure["models.qwen2_5_vl"]:
+            import_utils._import_structure["models.qwen2_5_vl"].append("Qwen2_5_VLProcessor")
+
+        import sys
+        import types
+
+        stub_module = types.ModuleType("transformers.models.qwen2_5_vl")
+        stub_module.Qwen2_5_VLProcessor = _StubQwenProcessor
+        sys.modules.setdefault("transformers.models.qwen2_5_vl", stub_module)
+    except Exception:
+        pass
+
+if hasattr(torch, "compile"):
+    torch.compile = lambda fn=None, **_: fn if fn is not None else (lambda f: f)
+
+utils_module = importlib.import_module("sglang.srt.utils")
+utils_module.cached_triton_kernel = lambda key_fn=None: (lambda fn: fn)
 
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
@@ -25,15 +121,10 @@ class TestInputFormatDetection(unittest.TestCase):
 
     def setUp(self):
         """Set up test fixtures."""
-        with patch("sglang.srt.utils.get_device", return_value="cpu"):
-            self.server_args = ServerArgs(model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
-            self.port_args = PortArgs.init_new(self.server_args)
-
-        with patch("zmq.asyncio.Context"), patch(
-            "sglang.srt.utils.get_zmq_socket"
-        ), patch("sglang.srt.hf_transformers_utils.get_tokenizer") as mock_tokenizer:
-            mock_tokenizer.return_value = Mock(vocab_size=32000)
-            self.tokenizer_manager = TokenizerManager(self.server_args, self.port_args)
+        with patch.object(TokenizerManager, "__init__", return_value=None):
+            self.tokenizer_manager = TokenizerManager(None, None)
+        self.tokenizer_manager.tokenizer = Mock()
+        self.tokenizer_manager.async_dynamic_batch_tokenizer = None
 
     def test_detect_single_string(self):
         """Test detection of single string input."""
@@ -119,15 +210,10 @@ class TestTokenizerInputPreparation(unittest.TestCase):
 
     def setUp(self):
         """Set up test fixtures."""
-        with patch("sglang.srt.utils.get_device", return_value="cpu"):
-            self.server_args = ServerArgs(model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
-            self.port_args = PortArgs.init_new(self.server_args)
-
-        with patch("zmq.asyncio.Context"), patch(
-            "sglang.srt.utils.get_zmq_socket"
-        ), patch("sglang.srt.hf_transformers_utils.get_tokenizer") as mock_tokenizer:
-            mock_tokenizer.return_value = Mock(vocab_size=32000)
-            self.tokenizer_manager = TokenizerManager(self.server_args, self.port_args)
+        with patch.object(TokenizerManager, "__init__", return_value=None):
+            self.tokenizer_manager = TokenizerManager(None, None)
+        self.tokenizer_manager.tokenizer = Mock()
+        self.tokenizer_manager.async_dynamic_batch_tokenizer = None
 
     def test_prepare_single_string_input(self):
         """Test preparation of single string input."""
@@ -171,15 +257,8 @@ class TestTokenizerResultExtraction(unittest.TestCase):
 
     def setUp(self):
         """Set up test fixtures."""
-        with patch("sglang.srt.utils.get_device", return_value="cpu"):
-            self.server_args = ServerArgs(model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
-            self.port_args = PortArgs.init_new(self.server_args)
-
-        with patch("zmq.asyncio.Context"), patch(
-            "sglang.srt.utils.get_zmq_socket"
-        ), patch("sglang.srt.hf_transformers_utils.get_tokenizer") as mock_tokenizer:
-            mock_tokenizer.return_value = Mock(vocab_size=32000)
-            self.tokenizer_manager = TokenizerManager(self.server_args, self.port_args)
+        with patch.object(TokenizerManager, "__init__", return_value=None):
+            self.tokenizer_manager = TokenizerManager(None, None)
 
     def test_extract_single_string_results(self):
         """Test extraction for single string input."""
@@ -273,15 +352,10 @@ class TestTokenizerManagerIntegration(unittest.TestCase):
 
     def setUp(self):
         """Set up test fixtures."""
-        with patch("sglang.srt.utils.get_device", return_value="cpu"):
-            self.server_args = ServerArgs(model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
-            self.port_args = PortArgs.init_new(self.server_args)
-
-        with patch("zmq.asyncio.Context"), patch(
-            "sglang.srt.utils.get_zmq_socket"
-        ), patch("sglang.srt.hf_transformers_utils.get_tokenizer") as mock_tokenizer:
-            mock_tokenizer.return_value = Mock(vocab_size=32000)
-            self.tokenizer_manager = TokenizerManager(self.server_args, self.port_args)
+        with patch.object(TokenizerManager, "__init__", return_value=None):
+            self.tokenizer_manager = TokenizerManager(None, None)
+        self.tokenizer_manager.tokenizer = Mock()
+        self.tokenizer_manager.async_dynamic_batch_tokenizer = None
 
     def test_full_workflow_single_string(self):
         """Test complete workflow for single string input."""
@@ -373,6 +447,58 @@ class TestTokenizerManagerIntegration(unittest.TestCase):
             result_input_ids, [[101, 7592, 102], [101, 2088, 102], [101, 2774, 102]]
         )
         self.assertIsNone(result_token_type_ids)
+
+
+class TestTokenizerManagerMultimodal(unittest.TestCase):
+    """Tests covering multimodal preprocessing behaviour."""
+
+    def setUp(self):
+        with patch.object(TokenizerManager, "__init__", return_value=None):
+            self.tokenizer_manager = TokenizerManager(None, None)
+        self.tokenizer_manager.max_req_input_len = None
+        self.tokenizer_manager.mm_processor = None
+        self.tokenizer_manager.tokenizer = Mock()
+        self.tokenizer_manager.server_args = SimpleNamespace(disable_radix_cache=True)
+        self.tokenizer_manager.async_dynamic_batch_tokenizer = None
+        self.tokenizer_manager.context_len = 4096
+        self.tokenizer_manager.reserve_input_token_num = 0
+        self.tokenizer_manager.enable_metrics = False
+        self.tokenizer_manager.log_requests = False
+        self.tokenizer_manager.log_requests_level = "info"
+        self.tokenizer_manager.preferred_sampling_params = None
+        self.tokenizer_manager.model_config = SimpleNamespace(vocab_size=32000)
+
+    def _make_generate_request(self, video_path: str) -> GenerateReqInput:
+        req = GenerateReqInput(
+            text="describe the video",
+            video_data=video_path,
+            sampling_params={"max_new_tokens": 1},
+        )
+        req.normalize_batch_and_arguments()
+        return req
+
+    def test_video_data_forwarded_to_mm_processor(self):
+        request = self._make_generate_request("/tmp/sample.mp4")
+
+        mm_processor_mock = AsyncMock(return_value={"input_ids": [1, 2, 3]})
+        self.tokenizer_manager.mm_processor = Mock()
+        self.tokenizer_manager.mm_processor.process_mm_data_async = mm_processor_mock
+
+        with patch.object(
+            self.tokenizer_manager,
+            "_tokenize_texts",
+            new=AsyncMock(return_value=([10, 11, 12], None)),
+        ), patch("sglang.srt.managers.tokenizer_manager.trace_slice_end"):
+            result = asyncio.run(
+                self.tokenizer_manager._tokenize_one_request(request)
+            )
+
+        mm_processor_mock.assert_awaited_once()
+        call_kwargs = mm_processor_mock.await_args.kwargs
+        self.assertIn("video_data", call_kwargs)
+        self.assertEqual(call_kwargs["video_data"], request.video_data)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.input_ids, [1, 2, 3])
 
 
 if __name__ == "__main__":

@@ -78,6 +78,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.mm_utils import TensorTransportMode
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
+from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.managers.scheduler import is_health_check_generate_req
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
 from sglang.srt.managers.tokenizer_communicator_mixin import TokenizerCommunicatorMixin
@@ -588,9 +589,14 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 obj.image_data = [obj.image_data]
             if not isinstance(obj.audio_data, list):
                 obj.audio_data = [obj.audio_data]
+            if obj.video_data is not None and not isinstance(obj.video_data, list):
+                obj.video_data = [obj.video_data]
+            if not has_valid_data(obj.video_data):
+                obj.video_data = None
             mm_inputs: Dict = await self.mm_processor.process_mm_data_async(
                 image_data=obj.image_data,
                 audio_data=obj.audio_data,
+                video_data=obj.video_data,
                 input_text=input_text or input_ids,
                 request_obj=obj,
                 max_req_input_len=self.max_req_input_len,
